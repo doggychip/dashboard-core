@@ -1,6 +1,6 @@
 {
   "name": "dashboard-core",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "description": "Shared core for the value-chain research dashboards (software-supply-chain, ai-supply-chain, semi-equipment). Express + Yahoo proxy, client assets, price-refresh CLI.",
   "main": "index.js",
   "bin": {
