@@ -10,7 +10,7 @@ const fs = require('fs');
 
 const { validateTicker, validateSymbols, mapLimit } = require('./helpers');
 const { TtlCache, dynamicTtl } = require('./cache');
-const { fetchYahooChart, fetchYahooOptions, fetchQuoteSummary, chartToQuote, chartToBars, quoteSummaryToExtras, UA } = require('./yahoo');
+const { fetchYahooChart, fetchYahooOptions, fetchQuoteSummary, chartToQuote, chartToBars, quoteSummaryToExtras, quoteSummaryToFundamentals, UA } = require('./yahoo');
 
 function loadTickerData(tickerData) {
   if (!tickerData) return [];
@@ -53,6 +53,11 @@ function createDashboardServer(opts = {}) {
     ttlMs: cacheTtlMs == null ? dynamicTtl() : cacheTtlMs,
     maxEntries: 500,
   });
+
+  // Separate long-TTL cache for /api/fundamentals — earnings history changes
+  // at most once a quarter, so a 1h TTL is plenty and spares Yahoo the load
+  // of re-fetching ~8 quoteSummary modules per ticker on every page load.
+  const fundamentalsCache = new TtlCache({ ttlMs: 3600_000, maxEntries: 500 });
 
   const validateOpts = { max: maxSymbolsPerRequest };
 
@@ -132,6 +137,59 @@ function createDashboardServer(opts = {}) {
       res.json(payload);
     } catch (err) {
       console.error('[dashboard-core] /api/quotes:', err.message);
+      res.status(502).json({ error: 'upstream fetch failed' });
+    }
+  });
+
+  // ── Fundamentals (earnings history + analyst + forward growth) ──
+  // Heavier and slower-changing than price, so this has its own long-TTL
+  // cache (1h) and is meant to be fetched ONCE on page load, not polled.
+  // Returns per-ticker { epsHistory[], revenueHistory[], nextEarningsDate,
+  // forward{}, analyst{}, trailingPE, forwardPE }. The client computes the
+  // buy-signal scorecard from this + the live polled price.
+  const FUNDAMENTALS_MODULES =
+    'earningsHistory,calendarEvents,earningsTrend,earnings,financialData,defaultKeyStatistics,summaryDetail,price';
+  app.get('/api/fundamentals', async (req, res) => {
+    let requested;
+    try {
+      requested = validateSymbols(req.query.symbols, validateOpts);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    try {
+      const symbols = requested.length ? requested : CANONICAL_TICKERS;
+      if (!symbols.length) return res.json({ updatedAt: Date.now(), fundamentals: {} });
+
+      const cacheKey = 'fundamentals:' + symbols.join(',');
+      const hit = fundamentalsCache.get(cacheKey);
+      if (hit) {
+        res.set('cache-control', 'public, max-age=3600');
+        return res.json(hit);
+      }
+
+      const fundamentals = {};
+      await mapLimit(symbols, fetchConcurrency, async (sym) => {
+        if (SKIP_LIVE.has(sym)) return;
+        const yahooSym = symbolAliases[sym] || sym;
+        try {
+          const data = await fetchQuoteSummary(yahooSym, {
+            timeoutMs: fetchTimeoutMs,
+            modules: FUNDAMENTALS_MODULES,
+          });
+          if (!data) return;
+          const f = quoteSummaryToFundamentals(data);
+          if (f) fundamentals[sym] = f;
+        } catch (err) {
+          console.warn(`[dashboard-core] /api/fundamentals ${sym}:`, err.message);
+        }
+      });
+
+      const payload = { updatedAt: Date.now(), fundamentals };
+      fundamentalsCache.set(cacheKey, payload);
+      res.set('cache-control', 'public, max-age=3600');
+      res.json(payload);
+    } catch (err) {
+      console.error('[dashboard-core] /api/fundamentals:', err.message);
       res.status(502).json({ error: 'upstream fetch failed' });
     }
   });
