@@ -10,7 +10,7 @@ const fs = require('fs');
 
 const { validateTicker, validateSymbols, mapLimit } = require('./helpers');
 const { TtlCache, dynamicTtl } = require('./cache');
-const { fetchYahooChart, fetchYahooOptions, chartToQuote, chartToBars, UA } = require('./yahoo');
+const { fetchYahooChart, fetchYahooOptions, fetchQuoteSummary, chartToQuote, chartToBars, quoteSummaryToExtras, UA } = require('./yahoo');
 
 function loadTickerData(tickerData) {
   if (!tickerData) return [];
@@ -107,9 +107,20 @@ function createDashboardServer(opts = {}) {
         if (SKIP_LIVE.has(sym)) return;
         const yahooSym = symbolAliases[sym] || sym;
         try {
-          const data = await fetchYahooChart(yahooSym, '1d', '1d', { timeoutMs: fetchTimeoutMs });
-          const q = chartToQuote(data);
-          if (q) quotes[sym] = q;
+          // Fetch chart (price/chg/chgPct) and quoteSummary (eps, pe, divYield,
+          // 52w, dayHi/Lo, volume, analyst PT, recommendation) in parallel.
+          // quoteSummary returns null on any failure (crumb-blocked, network)
+          // and the rest of the response is unaffected.
+          const [chartData, summaryData] = await Promise.all([
+            fetchYahooChart(yahooSym, '1d', '1d', { timeoutMs: fetchTimeoutMs }),
+            fetchQuoteSummary(yahooSym, { timeoutMs: fetchTimeoutMs }),
+          ]);
+          const q = chartToQuote(chartData);
+          if (q) {
+            const extras = summaryData ? quoteSummaryToExtras(summaryData) : null;
+            if (extras) q.extras = extras;
+            quotes[sym] = q;
+          }
         } catch (err) {
           console.warn(`[dashboard-core] /api/quotes ${sym}:`, err.message);
         }
