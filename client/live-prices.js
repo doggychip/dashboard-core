@@ -5,6 +5,11 @@
    TICKER_DATA object in place, then calls any render functions
    the page has registered via `window.dashboardRenderers.push(fn)`.
 
+   v1.0.6 change vs v1.0.5: derives the symbol list from the page's
+   own data on first poll and sends it as ?symbols=A,B,C so the
+   refresh works even when the server was started with tickerData:null
+   (in which case /api/quotes with no params returns an empty object).
+
    Dashboards opt in by:
      1. Loading this script (`<script src="/live-prices.js"></script>`)
      2. At the bottom of each render IIFE, adding:
@@ -17,7 +22,7 @@
 
   var INTERVAL_MS = 60000;          // poll every 60s
   var INITIAL_DELAY_MS = 800;       // small delay so first render finishes
-  var ENDPOINT = '/api/quotes';
+  var MAX_SYMBOLS = 200;            // dashboard-core's /api/quotes cap
 
   function detectSchema() {
     if (typeof window.SW_DATA === 'object' && window.SW_DATA && window.SW_DATA.tickers) {
@@ -28,6 +33,21 @@
       return { schema: 'ai', tickers: window.TICKER_DATA };
     }
     return null;
+  }
+
+  // Build the ?symbols=A,B,C list from the page's data, capped at MAX_SYMBOLS.
+  // We pass this explicitly so /api/quotes works for dashboards that don't
+  // wire up tickerData on the server (e.g. AI dashboard, where TICKER_DATA
+  // currently lives inline in HTML rather than an external JSON file).
+  function symbolsParam(tickers) {
+    var keys = Object.keys(tickers).filter(function (k) {
+      // Skip pure-numeric and dot-prefixed quirks that Yahoo doesn't recognise
+      // through the chart endpoint (e.g. '005930.KS' on the AI dashboard —
+      // that one is left in TICKER_DATA for static display).
+      return /^[A-Z][A-Z0-9.-]{0,9}$/.test(k);
+    });
+    if (keys.length > MAX_SYMBOLS) keys = keys.slice(0, MAX_SYMBOLS);
+    return keys.join(',');
   }
 
   // Merge one fresh quote into the page's per-ticker object, in place.
@@ -82,8 +102,11 @@
     var target = detectSchema();
     if (!target) return; // no data on page, nothing to do
 
+    var syms = symbolsParam(target.tickers);
+    var endpoint = '/api/quotes' + (syms ? '?symbols=' + encodeURIComponent(syms) : '');
+
     try {
-      var r = await fetch(ENDPOINT, { headers: { 'Accept': 'application/json' } });
+      var r = await fetch(endpoint, { headers: { 'Accept': 'application/json' } });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       var payload = await r.json();
       var quotes = payload && payload.quotes;
