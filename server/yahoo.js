@@ -1,7 +1,8 @@
-// Yahoo Finance v8 chart + v7 options endpoint wrappers.
+// Yahoo Finance v8 chart + v7 options + v10 quoteSummary endpoint wrappers.
 //
-// CAVEAT: both endpoints are unofficial. v7 has been tightening (some paths
-// now require a crumb). The User-Agent header is required to avoid 403.
+// CAVEAT: all three are unofficial. v10 quoteSummary requires a crumb+cookie
+// token obtained via fc.yahoo.com → /v1/test/getcrumb. The User-Agent header
+// is required on every endpoint to avoid 403.
 //
 // All requests go through fetchWithTimeout — no naked fetch() calls.
 
@@ -21,6 +22,104 @@ async function fetchYahooOptions(symbol, { timeoutMs = 10000 } = {}) {
   const r = await fetchWithTimeout(url, { headers: { 'User-Agent': UA } }, timeoutMs);
   if (!r.ok) throw new Error(`Yahoo ${r.status}`);
   return r.json();
+}
+
+// ─── crumb+cookie cache for quoteSummary v10 ─────────────────────────────
+// Process-wide. Sticky: a successful crumb is reused until process exits;
+// a failed dance is also remembered to avoid per-ticker hammering.
+let _crumbState = null; // { crumb, cookie } | { error }
+
+async function _doCrumbDance() {
+  // Step 1: GET fc.yahoo.com to obtain A1/A1S consent cookies.
+  const consent = await fetchWithTimeout('https://fc.yahoo.com/', {
+    headers: { 'User-Agent': UA },
+    redirect: 'manual',
+  }, 10000);
+  const setCookies = typeof consent.headers.getSetCookie === 'function'
+    ? consent.headers.getSetCookie()
+    : (consent.headers.get('set-cookie') ? [consent.headers.get('set-cookie')] : []);
+  const cookie = setCookies.map((c) => c.split(';')[0]).filter(Boolean).join('; ');
+  if (!cookie) throw new Error('crumb dance: no consent cookies');
+
+  // Step 2: GET getcrumb with the consent cookies → returns a short text token.
+  const crumbRes = await fetchWithTimeout('https://query1.finance.yahoo.com/v1/test/getcrumb', {
+    headers: { 'User-Agent': UA, Cookie: cookie },
+  }, 10000);
+  if (!crumbRes.ok) throw new Error(`crumb dance: getcrumb HTTP ${crumbRes.status}`);
+  const crumb = (await crumbRes.text()).trim();
+  if (!crumb || crumb.length > 64) throw new Error('crumb dance: invalid crumb response');
+  return { crumb, cookie };
+}
+
+async function ensureCrumb() {
+  if (_crumbState && _crumbState.crumb) return _crumbState;
+  if (_crumbState && _crumbState.error) throw _crumbState.error;
+  try {
+    _crumbState = await _doCrumbDance();
+    return _crumbState;
+  } catch (err) {
+    _crumbState = { error: err };
+    throw err;
+  }
+}
+
+// Fetch quoteSummary modules for a single symbol. Returns null on any failure
+// (network, crumb-blocked, missing modules) so callers can gracefully degrade.
+async function fetchQuoteSummary(symbol, { timeoutMs = 10000, modules = 'summaryDetail,defaultKeyStatistics,financialData,price' } = {}) {
+  let creds;
+  try { creds = await ensureCrumb(); }
+  catch { return null; }
+  const url =
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(symbol)}` +
+    `?modules=${modules}&crumb=${encodeURIComponent(creds.crumb)}`;
+  try {
+    const r = await fetchWithTimeout(url, {
+      headers: { 'User-Agent': UA, Cookie: creds.cookie },
+    }, timeoutMs);
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+// Convert a quoteSummary response to the flat per-ticker `extras` shape we
+// expose on /api/quotes. Numeric raw values only; clients format their own way.
+function quoteSummaryToExtras(data) {
+  const r = data?.quoteSummary?.result?.[0];
+  if (!r) return null;
+  const sd = r.summaryDetail || {};
+  const ks = r.defaultKeyStatistics || {};
+  const fd = r.financialData || {};
+  const pr = r.price || {};
+
+  const num = (n) => (typeof n?.raw === 'number' ? n.raw : (typeof n === 'number' ? n : null));
+
+  const out = {
+    marketCap:           num(sd.marketCap)          ?? num(pr.marketCap),
+    sharesOutstanding:   num(ks.sharesOutstanding),
+    trailingEps:         num(ks.trailingEps),
+    forwardEps:          num(ks.forwardEps),
+    trailingPE:          num(sd.trailingPE),
+    forwardPE:           num(sd.forwardPE)          ?? num(ks.forwardPE),
+    divYield:            num(sd.dividendYield),
+    fiftyTwoWeekHigh:    num(sd.fiftyTwoWeekHigh),
+    fiftyTwoWeekLow:     num(sd.fiftyTwoWeekLow),
+    dayHigh:             num(sd.dayHigh)            ?? num(pr.regularMarketDayHigh),
+    dayLow:              num(sd.dayLow)             ?? num(pr.regularMarketDayLow),
+    regularMarketVolume: num(sd.volume)             ?? num(pr.regularMarketVolume),
+    averageVolume:       num(sd.averageVolume)      ?? num(sd.averageVolume10days),
+    targetMeanPrice:     num(fd.targetMeanPrice),
+    targetMedianPrice:   num(fd.targetMedianPrice),
+    targetHighPrice:     num(fd.targetHighPrice),
+    targetLowPrice:      num(fd.targetLowPrice),
+    recommendationKey:   typeof fd.recommendationKey === 'string' ? fd.recommendationKey : null,
+    recommendationMean:  num(fd.recommendationMean),
+    numberOfAnalystOpinions: num(fd.numberOfAnalystOpinions),
+  };
+
+  // Strip nulls so JSON is compact and clients can `typeof === 'number'` check
+  // without explicit nulls overwriting existing data on merge.
+  for (const k of Object.keys(out)) if (out[k] == null) delete out[k];
+  return Object.keys(out).length ? out : null;
 }
 
 // Convert a Yahoo chart response to the shape the dashboard's /api/quotes returns.
@@ -57,6 +156,9 @@ module.exports = {
   UA,
   fetchYahooChart,
   fetchYahooOptions,
+  fetchQuoteSummary,
+  ensureCrumb,
   chartToQuote,
   chartToBars,
+  quoteSummaryToExtras,
 };
