@@ -122,6 +122,103 @@ function quoteSummaryToExtras(data) {
   return Object.keys(out).length ? out : null;
 }
 
+// Convert a quoteSummary response (with earnings modules) to the per-ticker
+// `fundamentals` shape exposed on /api/fundamentals. Includes the last-4-quarter
+// EPS beat/miss history, quarterly revenue trend, next earnings date, and
+// forward EPS/revenue growth consensus — everything the client signal needs.
+//
+// Required modules: earningsHistory,calendarEvents,earningsTrend,earnings,
+//                   financialData,defaultKeyStatistics,summaryDetail,price
+function quoteSummaryToFundamentals(data) {
+  const r = data?.quoteSummary?.result?.[0];
+  if (!r) return null;
+  const num = (n) => (typeof n?.raw === 'number' ? n.raw : (typeof n === 'number' ? n : null));
+
+  const out = {};
+
+  // ── EPS beat/miss history (last 4 quarters) ──
+  // earningsHistory.history is ordered oldest→newest; period is "-4q".."-1q".
+  const hist = r.earningsHistory?.history;
+  if (Array.isArray(hist) && hist.length) {
+    out.epsHistory = hist.map((h) => ({
+      period: h.period || null,                          // e.g. "-1q"
+      quarter: h.quarter?.fmt || null,                   // e.g. "2026-03-31"
+      epsActual: num(h.epsActual),
+      epsEstimate: num(h.epsEstimate),
+      surprisePct: num(h.surprisePercent) != null ? +(num(h.surprisePercent) * 100).toFixed(2) : null,
+      beat: (num(h.epsActual) != null && num(h.epsEstimate) != null)
+        ? num(h.epsActual) >= num(h.epsEstimate)
+        : null,
+    })).filter((e) => e.epsActual != null);
+  }
+
+  // ── Quarterly revenue + earnings trend ──
+  const fc = r.earnings?.financialsChart?.quarterly;
+  if (Array.isArray(fc) && fc.length) {
+    out.revenueHistory = fc.map((q) => ({
+      date: q.date || null,                              // e.g. "1Q2026"
+      revenue: num(q.revenue),
+      earnings: num(q.earnings),
+    })).filter((q) => q.revenue != null);
+  }
+
+  // ── Next earnings date ──
+  // calendarEvents.earnings.earningsDate is an array of 1–2 epoch entries.
+  const cal = r.calendarEvents?.earnings;
+  if (cal && Array.isArray(cal.earningsDate) && cal.earningsDate.length) {
+    out.nextEarningsDate = cal.earningsDate[0]?.fmt || null;
+    out.nextEarningsDateEnd = cal.earningsDate[1]?.fmt || null; // range upper bound, if any
+    out.nextEpsEstimate = num(cal.earningsAverage);
+    out.nextRevenueEstimate = num(cal.revenueAverage);
+    out.isEarningsDateEstimate = cal.isEarningsDateEstimate === true;
+  }
+
+  // ── Forward growth consensus (earningsTrend) ──
+  // trend[] periods: "0q" current Q, "+1q", "0y" current year, "+1y" next year.
+  const trend = r.earningsTrend?.trend;
+  if (Array.isArray(trend)) {
+    const byPeriod = {};
+    for (const t of trend) if (t.period) byPeriod[t.period] = t;
+    const g = (p) => num(byPeriod[p]?.growth);
+    const revG = (p) => num(byPeriod[p]?.revenueEstimate?.growth);
+    out.forward = {
+      epsGrowthCurrentQ: g('0q') != null ? +(g('0q') * 100).toFixed(2) : null,
+      epsGrowthNextQ: g('+1q') != null ? +(g('+1q') * 100).toFixed(2) : null,
+      epsGrowthCurrentY: g('0y') != null ? +(g('0y') * 100).toFixed(2) : null,
+      epsGrowthNextY: g('+1y') != null ? +(g('+1y') * 100).toFixed(2) : null,
+      revGrowthCurrentY: revG('0y') != null ? +(revG('0y') * 100).toFixed(2) : null,
+      revGrowthNextY: revG('+1y') != null ? +(revG('+1y') * 100).toFixed(2) : null,
+    };
+    // drop if entirely empty
+    if (Object.values(out.forward).every((v) => v == null)) delete out.forward;
+  }
+
+  // ── Analyst + valuation snapshot (for the signal) ──
+  const fd = r.financialData || {};
+  const sd = r.summaryDetail || {};
+  const analyst = {
+    recommendationKey: typeof fd.recommendationKey === 'string' ? fd.recommendationKey : null,
+    recommendationMean: num(fd.recommendationMean),
+    numberOfAnalystOpinions: num(fd.numberOfAnalystOpinions),
+    targetMeanPrice: num(fd.targetMeanPrice),
+    targetMedianPrice: num(fd.targetMedianPrice),
+    currentPrice: num(fd.currentPrice),
+    revenueGrowth: num(fd.revenueGrowth) != null ? +(num(fd.revenueGrowth) * 100).toFixed(2) : null,
+    earningsGrowth: num(fd.earningsGrowth) != null ? +(num(fd.earningsGrowth) * 100).toFixed(2) : null,
+    grossMargins: num(fd.grossMargins) != null ? +(num(fd.grossMargins) * 100).toFixed(2) : null,
+    profitMargins: num(sd.profitMargins ?? r.defaultKeyStatistics?.profitMargins) != null
+      ? +(num(sd.profitMargins ?? r.defaultKeyStatistics?.profitMargins) * 100).toFixed(2) : null,
+  };
+  for (const k of Object.keys(analyst)) if (analyst[k] == null) delete analyst[k];
+  if (Object.keys(analyst).length) out.analyst = analyst;
+
+  out.trailingPE = num(sd.trailingPE);
+  out.forwardPE  = num(sd.forwardPE) ?? num(r.defaultKeyStatistics?.forwardPE);
+  for (const k of ['trailingPE', 'forwardPE']) if (out[k] == null) delete out[k];
+
+  return Object.keys(out).length ? out : null;
+}
+
 // Convert a Yahoo chart response to the shape the dashboard's /api/quotes returns.
 function chartToQuote(data) {
   const meta = data?.chart?.result?.[0]?.meta;
@@ -161,4 +258,5 @@ module.exports = {
   chartToQuote,
   chartToBars,
   quoteSummaryToExtras,
+  quoteSummaryToFundamentals,
 };
