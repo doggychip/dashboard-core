@@ -4,7 +4,8 @@
   "description": "Shared core for the value-chain research dashboards (software-supply-chain, ai-supply-chain, semi-equipment). Express + Yahoo proxy, client assets, price-refresh CLI.",
   "main": "index.js",
   "bin": {
-    "update-prices": "./bin/update-prices.js"
+    "update-prices": "./bin/update-prices.js",
+    "log-scores": "./bin/log-scores.js"
   },
   "files": [
     "index.js",
