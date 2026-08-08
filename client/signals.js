@@ -69,8 +69,24 @@
   // Returns: { score (0-100), label, breakdown[], dataCoverage }
   // ──────────────────────────────────────────────────────────────
   var MIN_COVERAGE = 3;
+  var HISTORY_FRESH_DAYS = 14; // ~10 trading sessions
 
-  function computeSignal(t) {
+  // The 20d-momentum component divides live price by priceHistory[len-21] —
+  // but priceHistory only changes on update-prices runs. If the baseline is
+  // stale, "20 sessions" silently becomes months. update-prices >= v1.0.10
+  // stamps SW_DATA.refreshedAt (YYYY-MM-DD); momentum only counts when that
+  // stamp exists and is recent. Unstamped or old data → component skipped
+  // (normalization excludes it), so staleness is visible, never silent.
+  function historyIsFresh() {
+    var d = window.SW_DATA && window.SW_DATA.refreshedAt;
+    if (!d) return false;
+    var ms = Date.parse(d);
+    if (isNaN(ms)) return false;
+    return (Date.now() - ms) <= HISTORY_FRESH_DAYS * 86400000;
+  }
+
+  function computeSignal(t, historyFresh) {
+    if (historyFresh === undefined) historyFresh = historyIsFresh();
     if (!t) return null;
     var f = t.fundamentals;
     if (!f) return null;
@@ -155,7 +171,7 @@
     //    counterweight to #5: a crashing stock loses momentum points as its
     //    "upside" expands.
     var ph = t.priceHistory;
-    if (Array.isArray(ph) && ph.length >= 21 && price != null && price > 0) {
+    if (historyFresh && Array.isArray(ph) && ph.length >= 21 && price != null && price > 0) {
       var then = ph[ph.length - 21];
       if (typeof then === 'number' && then > 0) {
         var mom = ((price - then) / then) * 100;
