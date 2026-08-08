@@ -34,10 +34,9 @@
     sec.className = 'section';
     sec.innerHTML =
       '<div class="section-header"><div>' +
-      '<div class="section-title">📊 Earnings &amp; Signals</div>' +
-      '<div class="section-desc">Live earnings results + a transparent, rules-based signal. ' +
-      '<strong>Not financial advice</strong> — a mechanical score from Yahoo data ' +
-      '(EPS beat/miss, forward growth, analyst consensus, upside to price target). ' +
+      '<div class="section-title">📊 Earnings Evidence Summary</div>' +
+      '<div class="section-desc">Current fundamentals summarized with explicit coverage and freshness checks. ' +
+      '<strong>Descriptive only — not a return forecast, not financial advice, and not historically validated.</strong> ' +
       'Updated <span data-dynamic-date="full"></span>.</div></div></div>' +
       '<div id="signalsTableWrap" style="overflow-x:auto"><div style="padding:24px;color:var(--muted,#888);font-size:13px">Loading live earnings data…</div></div>';
     content.appendChild(sec);
@@ -88,17 +87,17 @@
 
   function signalBadge(sig) {
     if (!sig) return '<span style="color:var(--faint,#888)">—</span>';
-    // 'Low data' (< 3 components) renders grey — the components that remain
-    // are usually the bullish-skewed analyst ones, so no quality label.
-    var lowData = sig.label === 'Low data';
+    // 'Insufficient data' (< 4 components) renders grey with no score — the
+    // surviving components are usually the bullish-skewed analyst ones.
+    var lowData = sig.status === 'insufficient';
     var color = lowData ? 'var(--faint,#888)'
-      : sig.label === 'Strong' ? 'var(--success,#56cc84)'
-      : sig.label === 'Moderate' ? 'var(--warn,#f0ad4e)' : 'var(--error,#f07070)';
+      : sig.label === 'Higher evidence' ? 'var(--success,#56cc84)'
+      : sig.label === 'Mixed evidence' ? 'var(--warn,#f0ad4e)' : 'var(--error,#f07070)';
     var tip = sig.breakdown.map(function (b) { return b.label + ': ' + b.points + '/' + b.max + (b.detail ? ' — ' + b.detail : ''); }).join('\n')
       + '\nData coverage: ' + sig.dataCoverage + ' of 6 components';
     var cov = '<span style="font-size:9px;color:var(--faint,#888)">' + sig.dataCoverage + '/6</span>';
     return '<span title="' + esc(tip) + '" style="display:inline-flex;align-items:center;gap:5px;font-weight:700">' +
-      '<span style="font-variant-numeric:tabular-nums;color:' + color + '">' + sig.score + '</span>' + cov +
+      '<span style="font-variant-numeric:tabular-nums;color:' + color + '">' + (sig.score == null ? '—' : sig.score) + '</span>' + cov +
       '<span style="font-size:10px;padding:1px 6px;border-radius:10px;background:color-mix(in srgb,' + color + ' 18%,transparent);color:' + color + '">' + sig.label + '</span>' +
       '</span>';
   }
@@ -128,12 +127,16 @@
 
     // Sort by signal score desc (tickers with a signal first), then alpha.
     rows.sort(function (a, b) {
-      var sa = sigs[a] ? sigs[a].score : -1, sb = sigs[b] ? sigs[b].score : -1;
+      var sa = sigs[a] && sigs[a].score != null ? sigs[a].score : -1;
+      var sb = sigs[b] && sigs[b].score != null ? sigs[b].score : -1;
       if (sb !== sa) return sb - sa;
       return a < b ? -1 : 1;
     });
 
-    var html = '<table class="val-table" style="width:100%;font-size:12px">' +
+    var html = '<div style="padding:10px 12px;margin-bottom:10px;border:1px solid var(--border,#444);border-radius:8px;color:var(--muted,#999);font-size:11px">' +
+      '<strong style="color:var(--text,#ddd)">Descriptive evidence summary — not a return forecast.</strong> ' +
+      'At least 4 of 6 components are required for a score. Weights: last-Q EPS 20, prior-Q consistency 15, forward EPS growth 20, analyst consensus 15, price-target gap 10, 20d momentum 20 (fresh price history only). Piecewise-linear scoring, no threshold cliffs.</div>' +
+      '<table class="val-table" style="width:100%;font-size:12px">' +
       '<thead><tr>' +
       '<th style="text-align:left">Ticker</th>' +
       '<th style="text-align:left">Next Earnings</th>' +

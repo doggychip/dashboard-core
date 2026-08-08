@@ -68,15 +68,17 @@
   //
   // Returns: { score (0-100), label, breakdown[], dataCoverage }
   // ──────────────────────────────────────────────────────────────
-  var MIN_COVERAGE = 3;
-  var HISTORY_FRESH_DAYS = 14; // ~10 trading sessions
+  // ──────────────────────────────────────────────────────────────
+  // UNIFIED EVIDENCE SCORER — identical math to lib/signals/score.js
+  // (the canonical, unit-tested copy). If you change one, change both;
+  // the test suite runs a parity check across fixtures.
+  //
+  // Descriptive evidence summary — NOT a return forecast, and not
+  // historically validated. Piecewise-linear anchors, no step cliffs.
+  // ──────────────────────────────────────────────────────────────
+  var MIN_COVERAGE = 4;
+  var HISTORY_FRESH_DAYS = 14;
 
-  // The 20d-momentum component divides live price by priceHistory[len-21] —
-  // but priceHistory only changes on update-prices runs. If the baseline is
-  // stale, "20 sessions" silently becomes months. update-prices >= v1.0.10
-  // stamps SW_DATA.refreshedAt (YYYY-MM-DD); momentum only counts when that
-  // stamp exists and is recent. Unstamped or old data → component skipped
-  // (normalization excludes it), so staleness is visible, never silent.
   function historyIsFresh() {
     var d = window.SW_DATA && window.SW_DATA.refreshedAt;
     if (!d) return false;
@@ -85,114 +87,102 @@
     return (Date.now() - ms) <= HISTORY_FRESH_DAYS * 86400000;
   }
 
+  function lerp(anchors, x) {
+    if (x <= anchors[0][0]) return anchors[0][1];
+    var last = anchors[anchors.length - 1];
+    if (x >= last[0]) return last[1];
+    for (var i = 1; i < anchors.length; i++) {
+      var x1 = anchors[i - 1][0], y1 = anchors[i - 1][1];
+      var x2 = anchors[i][0], y2 = anchors[i][1];
+      if (x <= x2) return y1 + ((x - x1) / (x2 - x1)) * (y2 - y1);
+    }
+    return last[1];
+  }
+
+  var CURVES = {
+    lastQ: [[-10, 0], [10, 20]],
+    fwdGrowth: [[0, 0], [25, 20]],
+    analystMean: [[1, 15], [3, 5], [4.5, 0]],
+    ptGap: [[-10, 0], [0, 4], [25, 10]],
+    momentum: [[-10, 0], [0, 10], [15, 20]],
+  };
+
   function computeSignal(t, historyFresh) {
     if (historyFresh === undefined) historyFresh = historyIsFresh();
-    if (!t) return null;
+    if (!t || !t.fundamentals) return null;
     var f = t.fundamentals;
-    if (!f) return null;
-
     var parts = [];
 
-    // Defensive copy + sort by quarter date (server sorts too; don't trust it).
     var hist = (f.epsHistory || []).slice().sort(function (a, b) {
       if (a.quarter && b.quarter) return a.quarter < b.quarter ? -1 : a.quarter > b.quarter ? 1 : 0;
       return 0;
     });
 
-    // 1. Last-quarter EPS beat (0-20)
     if (hist.length) {
       var last = hist[hist.length - 1];
-      var pts = null, detail;
-      if (last.beat === true) {
-        var surp = typeof last.surprisePct === 'number' ? last.surprisePct : 0;
-        pts = surp >= 10 ? 20 : (surp >= 2 ? 16 : 12);
-        detail = 'Beat by ' + (last.surprisePct != null ? last.surprisePct.toFixed(1) + '%' : '—');
-      } else if (last.beat === false) {
-        pts = 4;
-        detail = 'Missed by ' + (last.surprisePct != null ? Math.abs(last.surprisePct).toFixed(1) + '%' : '—');
+      if (last.beat === true || last.beat === false) {
+        var surprise = typeof last.surprisePct === 'number' ? last.surprisePct : (last.beat ? 0.01 : -0.01);
+        parts.push({ label: 'Last-Q EPS', points: lerp(CURVES.lastQ, surprise), max: 20,
+          detail: (last.beat ? 'Beat ' : 'Miss ') + Math.abs(surprise).toFixed(1) + '%' });
       }
-      if (pts != null) parts.push({ label: 'Last-Q EPS', points: pts, max: 20, detail: detail });
     }
 
-    // 2. Beat streak over PRIOR quarters — excludes the latest quarter so the
-    //    same beat isn't counted in both #1 and #2.
     if (hist.length > 1) {
       var prior = hist.slice(0, -1);
-      var beats = prior.filter(function (h) { return h.beat === true; }).length;
-      var graded = prior.filter(function (h) { return h.beat === true || h.beat === false; }).length;
-      if (graded > 0) {
-        var consistency = Math.round((beats / Math.min(graded, 3)) * 20);
-        parts.push({
-          label: 'Beat streak',
-          points: Math.min(consistency, 20),
-          max: 20,
-          detail: beats + '/' + graded + ' prior quarters beat',
-        });
+      var graded = prior.filter(function (h) { return h.beat === true || h.beat === false; });
+      if (graded.length) {
+        var beats = graded.filter(function (h) { return h.beat === true; }).length;
+        parts.push({ label: 'Prior-Q consistency', points: (beats / graded.length) * 15, max: 15,
+          detail: beats + '/' + graded.length + ' prior quarters beat' });
       }
     }
 
-    // 3. Forward EPS growth, next year (0-20). Falls back to latest-quarter
-    //    YoY earnings growth — a different horizon, so the detail says so.
     var fwdG = f.forward && typeof f.forward.epsGrowthNextY === 'number' ? f.forward.epsGrowthNextY : null;
     var fwdSrc = 'next-yr est';
     if (fwdG == null && f.analyst && typeof f.analyst.earningsGrowth === 'number') {
-      fwdG = f.analyst.earningsGrowth;
-      fwdSrc = 'latest-Q YoY';
+      fwdG = f.analyst.earningsGrowth; fwdSrc = 'latest-Q YoY';
     }
     if (fwdG != null) {
-      var gp = fwdG >= 25 ? 20 : fwdG >= 15 ? 15 : fwdG >= 5 ? 10 : fwdG > 0 ? 5 : 0;
-      parts.push({ label: 'Fwd EPS growth', points: gp, max: 20, detail: fwdG.toFixed(1) + '% (' + fwdSrc + ')' });
+      parts.push({ label: 'Fwd EPS growth', points: lerp(CURVES.fwdGrowth, fwdG), max: 20,
+        detail: fwdG.toFixed(1) + '% (' + fwdSrc + ')' });
     }
 
-    // 4. Analyst consensus (0-20) — recommendationMean 1=Strong Buy … 5=Strong Sell.
-    //    NOTE: sell-side consensus skews bullish; this is why the label needs
-    //    MIN_COVERAGE and why #5 is capped at 10.
     var rm = f.analyst && typeof f.analyst.recommendationMean === 'number' ? f.analyst.recommendationMean : null;
     if (rm != null) {
-      var ap = rm <= 1.5 ? 20 : rm <= 2.0 ? 16 : rm <= 2.5 ? 12 : rm <= 3.0 ? 8 : rm <= 3.5 ? 4 : 0;
       var key = f.analyst.recommendationKey ? f.analyst.recommendationKey.replace(/_/g, ' ') : ('mean ' + rm.toFixed(2));
       var nOp = f.analyst.numberOfAnalystOpinions;
-      parts.push({ label: 'Analyst view', points: ap, max: 20, detail: key + (nOp ? ' (' + nOp + ')' : '') });
+      parts.push({ label: 'Analyst view', points: lerp(CURVES.analystMean, rm), max: 15,
+        detail: key + (nOp ? ' (' + nOp + ')' : '') });
     }
 
-    // 5. Upside to mean price target (0-10, uses LIVE price). Half-weight:
-    //    PTs lag price, so upside mechanically inflates after a crash.
     var pt = f.analyst && typeof f.analyst.targetMeanPrice === 'number' ? f.analyst.targetMeanPrice : null;
     var price = typeof t.price === 'number' ? t.price : null;
     if (pt != null && price != null && price > 0) {
       var upside = ((pt - price) / price) * 100;
-      var up = upside >= 25 ? 10 : upside >= 10 ? 7 : upside >= 0 ? 4 : upside >= -10 ? 2 : 0;
-      parts.push({ label: 'Upside to PT', points: up, max: 10, detail: (upside >= 0 ? '+' : '') + upside.toFixed(1) + '% to $' + pt.toFixed(0) });
+      parts.push({ label: 'PT gap', points: lerp(CURVES.ptGap, upside), max: 10,
+        detail: (upside >= 0 ? '+' : '') + upside.toFixed(1) + '% to $' + pt.toFixed(0) });
     }
 
-    // 6. 20-day momentum (0-20) — from priceHistory (daily closes) when the
-    //    dashboard carries it (SW schema does; AI schema doesn't). Uses the
-    //    live price as the endpoint so it tracks intraday. This is the
-    //    counterweight to #5: a crashing stock loses momentum points as its
-    //    "upside" expands.
     var ph = t.priceHistory;
     if (historyFresh && Array.isArray(ph) && ph.length >= 21 && price != null && price > 0) {
       var then = ph[ph.length - 21];
       if (typeof then === 'number' && then > 0) {
         var mom = ((price - then) / then) * 100;
-        var mp = mom >= 15 ? 20 : mom >= 5 ? 15 : mom >= 0 ? 10 : mom >= -10 ? 5 : 0;
-        parts.push({ label: '20d momentum', points: mp, max: 20, detail: (mom >= 0 ? '+' : '') + mom.toFixed(1) + '% over 20 sessions' });
+        parts.push({ label: '20d momentum', points: lerp(CURVES.momentum, mom), max: 20,
+          detail: (mom >= 0 ? '+' : '') + mom.toFixed(1) + '% over 20 sessions' });
       }
     }
 
     if (!parts.length) return null;
-
-    var earned = parts.reduce(function (s, p) { return s + p.points; }, 0);
-    var possible = parts.reduce(function (s, p) { return s + p.max; }, 0);
-    var score = Math.round((earned / possible) * 100);
-    var label;
+    var rounded = parts.map(function (p) { return { label: p.label, points: Math.round(p.points * 10) / 10, max: p.max, detail: p.detail }; });
     if (parts.length < MIN_COVERAGE) {
-      label = 'Low data';
-    } else {
-      label = score >= 70 ? 'Strong' : score >= 45 ? 'Moderate' : 'Weak';
+      return { score: null, label: 'Insufficient data', status: 'insufficient', breakdown: rounded, dataCoverage: parts.length };
     }
-
-    return { score: score, label: label, breakdown: parts, dataCoverage: parts.length };
+    var earned = parts.reduce(function (s2, p) { return s2 + p.points; }, 0);
+    var possible = parts.reduce(function (s2, p) { return s2 + p.max; }, 0);
+    var score = Math.round((earned / possible) * 100);
+    var label = score >= 70 ? 'Higher evidence' : score >= 45 ? 'Mixed evidence' : 'Lower evidence';
+    return { score: score, label: label, status: 'rated', breakdown: rounded, dataCoverage: parts.length };
   }
 
   // Recompute every ticker's signal into window.tickerSignals using the
