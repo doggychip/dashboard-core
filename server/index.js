@@ -71,6 +71,13 @@ function createDashboardServer(opts = {}) {
   app.use(express.static(publicDir));
 
   // ── Single-quote ───────────────────────────────────────────────
+  // Honors optional ?range= and ?interval= (whitelisted). Previously the
+  // route silently ignored them and always fetched 6mo/1d, which broke
+  // callers requesting 1d/5m: on a 6mo response meta.previousClose is
+  // frequently absent, so clients falling back to chartPreviousClose got
+  // the close from ~6 months ago and rendered it as the daily change.
+  const QUOTE_RANGES = new Set(['1d', '5d', '1mo', '3mo', '6mo', '1y', '2y']);
+  const QUOTE_INTERVALS = new Set(['1m', '2m', '5m', '15m', '30m', '60m', '1d', '1wk']);
   app.get('/api/quote/:symbol', async (req, res) => {
     let sym;
     try {
@@ -78,9 +85,11 @@ function createDashboardServer(opts = {}) {
     } catch (err) {
       return res.status(400).json({ error: err.message });
     }
+    const range = QUOTE_RANGES.has(req.query.range) ? req.query.range : '6mo';
+    const interval = QUOTE_INTERVALS.has(req.query.interval) ? req.query.interval : '1d';
     try {
       const yahooSym = symbolAliases[sym] || sym;
-      const data = await fetchYahooChart(yahooSym, '6mo', '1d', { timeoutMs: fetchTimeoutMs });
+      const data = await fetchYahooChart(yahooSym, range, interval, { timeoutMs: fetchTimeoutMs });
       res.json(data);
     } catch (err) {
       console.error(`[dashboard-core] /api/quote/${sym}:`, err.message);

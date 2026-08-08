@@ -88,11 +88,17 @@
 
   function signalBadge(sig) {
     if (!sig) return '<span style="color:var(--faint,#888)">—</span>';
-    var color = sig.label === 'Strong' ? 'var(--success,#56cc84)'
+    // 'Low data' (< 3 components) renders grey — the components that remain
+    // are usually the bullish-skewed analyst ones, so no quality label.
+    var lowData = sig.label === 'Low data';
+    var color = lowData ? 'var(--faint,#888)'
+      : sig.label === 'Strong' ? 'var(--success,#56cc84)'
       : sig.label === 'Moderate' ? 'var(--warn,#f0ad4e)' : 'var(--error,#f07070)';
-    var tip = sig.breakdown.map(function (b) { return b.label + ': ' + b.points + '/' + b.max + (b.detail ? ' — ' + b.detail : ''); }).join('\n');
-    return '<span title="' + esc(tip) + '" style="display:inline-flex;align-items:center;gap:6px;font-weight:700">' +
-      '<span style="font-variant-numeric:tabular-nums;color:' + color + '">' + sig.score + '</span>' +
+    var tip = sig.breakdown.map(function (b) { return b.label + ': ' + b.points + '/' + b.max + (b.detail ? ' — ' + b.detail : ''); }).join('\n')
+      + '\nData coverage: ' + sig.dataCoverage + ' of 6 components';
+    var cov = '<span style="font-size:9px;color:var(--faint,#888)">' + sig.dataCoverage + '/6</span>';
+    return '<span title="' + esc(tip) + '" style="display:inline-flex;align-items:center;gap:5px;font-weight:700">' +
+      '<span style="font-variant-numeric:tabular-nums;color:' + color + '">' + sig.score + '</span>' + cov +
       '<span style="font-size:10px;padding:1px 6px;border-radius:10px;background:color-mix(in srgb,' + color + ' 18%,transparent);color:' + color + '">' + sig.label + '</span>' +
       '</span>';
   }
@@ -136,7 +142,7 @@
       '<th style="text-align:right">Fwd EPS Growth</th>' +
       '<th style="text-align:left">Analyst</th>' +
       '<th style="text-align:right" title="Upside to mean price target at the live price">Upside</th>' +
-      '<th style="text-align:right" title="Mechanical score 0–100 from the columns at left. Hover for the breakdown. Not financial advice.">Signal</th>' +
+      '<th style="text-align:right" title="Mechanical score 0–100 from 6 data components (hover a score for its breakdown and coverage). Scores with <3 components show as Low data. Not financial advice.">Signal</th>' +
       '</tr></thead><tbody>';
 
     rows.forEach(function (sym) {
