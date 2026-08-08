@@ -47,15 +47,29 @@
   }
 
   // ──────────────────────────────────────────────────────────────
-  // THE SIGNAL — fully transparent, 5 components, 20 points each.
+  // THE SIGNAL — fully transparent, 6 components, normalized.
   //
-  // Components with missing data are skipped, and the final score is
-  // normalized over the components that DID have data (so a ticker
-  // lacking analyst coverage isn't unfairly zeroed). `dataCoverage`
-  // reports how many of the 5 components contributed.
+  //   1. Last-Q EPS beat ................ max 20
+  //   2. Beat streak (PRIOR quarters,
+  //      excludes the latest so it isn't
+  //      double-counted with #1) ........ max 20
+  //   3. Forward EPS growth ............. max 20
+  //   4. Analyst consensus .............. max 20
+  //   5. Upside to mean price target .... max 10  (halved: analyst PTs lag
+  //      price, so raw upside rewards falling knives; momentum offsets)
+  //   6. 20-day momentum from
+  //      priceHistory (when present) .... max 20
   //
-  // Returns: { score (0-100|null), label, breakdown[], dataCoverage }
+  // Components with missing data are skipped and the score is normalized
+  // over the max-points of the components that DID have data. A result
+  // with fewer than MIN_COVERAGE components gets no Strong/Moderate/Weak
+  // label (label='Low data') — the remaining components are typically the
+  // analyst-derived ones, which skew bullish.
+  //
+  // Returns: { score (0-100), label, breakdown[], dataCoverage }
   // ──────────────────────────────────────────────────────────────
+  var MIN_COVERAGE = 3;
+
   function computeSignal(t) {
     if (!t) return null;
     var f = t.fundamentals;
@@ -63,11 +77,16 @@
 
     var parts = [];
 
+    // Defensive copy + sort by quarter date (server sorts too; don't trust it).
+    var hist = (f.epsHistory || []).slice().sort(function (a, b) {
+      if (a.quarter && b.quarter) return a.quarter < b.quarter ? -1 : a.quarter > b.quarter ? 1 : 0;
+      return 0;
+    });
+
     // 1. Last-quarter EPS beat (0-20)
-    var hist = f.epsHistory || [];
     if (hist.length) {
       var last = hist[hist.length - 1];
-      var pts, detail;
+      var pts = null, detail;
       if (last.beat === true) {
         var surp = typeof last.surprisePct === 'number' ? last.surprisePct : 0;
         pts = surp >= 10 ? 20 : (surp >= 2 ? 16 : 12);
@@ -75,34 +94,43 @@
       } else if (last.beat === false) {
         pts = 4;
         detail = 'Missed by ' + (last.surprisePct != null ? Math.abs(last.surprisePct).toFixed(1) + '%' : '—');
-      } else { pts = null; detail = 'No estimate'; }
+      }
       if (pts != null) parts.push({ label: 'Last-Q EPS', points: pts, max: 20, detail: detail });
     }
 
-    // 2. Beat consistency over available history (0-20): 5 pts per beat, up to 4Q
-    if (hist.length) {
-      var beats = hist.filter(function (h) { return h.beat === true; }).length;
-      var graded = hist.filter(function (h) { return h.beat === true || h.beat === false; }).length;
+    // 2. Beat streak over PRIOR quarters — excludes the latest quarter so the
+    //    same beat isn't counted in both #1 and #2.
+    if (hist.length > 1) {
+      var prior = hist.slice(0, -1);
+      var beats = prior.filter(function (h) { return h.beat === true; }).length;
+      var graded = prior.filter(function (h) { return h.beat === true || h.beat === false; }).length;
       if (graded > 0) {
-        var consistency = Math.round((beats / Math.min(graded, 4)) * 20);
+        var consistency = Math.round((beats / Math.min(graded, 3)) * 20);
         parts.push({
           label: 'Beat streak',
           points: Math.min(consistency, 20),
           max: 20,
-          detail: beats + '/' + graded + ' quarters beat',
+          detail: beats + '/' + graded + ' prior quarters beat',
         });
       }
     }
 
-    // 3. Forward EPS growth, next year (0-20)
+    // 3. Forward EPS growth, next year (0-20). Falls back to latest-quarter
+    //    YoY earnings growth — a different horizon, so the detail says so.
     var fwdG = f.forward && typeof f.forward.epsGrowthNextY === 'number' ? f.forward.epsGrowthNextY : null;
-    if (fwdG == null && f.analyst && typeof f.analyst.earningsGrowth === 'number') fwdG = f.analyst.earningsGrowth;
+    var fwdSrc = 'next-yr est';
+    if (fwdG == null && f.analyst && typeof f.analyst.earningsGrowth === 'number') {
+      fwdG = f.analyst.earningsGrowth;
+      fwdSrc = 'latest-Q YoY';
+    }
     if (fwdG != null) {
       var gp = fwdG >= 25 ? 20 : fwdG >= 15 ? 15 : fwdG >= 5 ? 10 : fwdG > 0 ? 5 : 0;
-      parts.push({ label: 'Fwd EPS growth', points: gp, max: 20, detail: fwdG.toFixed(1) + '% YoY' });
+      parts.push({ label: 'Fwd EPS growth', points: gp, max: 20, detail: fwdG.toFixed(1) + '% (' + fwdSrc + ')' });
     }
 
-    // 4. Analyst consensus (0-20) from recommendationMean (1=Strong Buy … 5=Strong Sell)
+    // 4. Analyst consensus (0-20) — recommendationMean 1=Strong Buy … 5=Strong Sell.
+    //    NOTE: sell-side consensus skews bullish; this is why the label needs
+    //    MIN_COVERAGE and why #5 is capped at 10.
     var rm = f.analyst && typeof f.analyst.recommendationMean === 'number' ? f.analyst.recommendationMean : null;
     if (rm != null) {
       var ap = rm <= 1.5 ? 20 : rm <= 2.0 ? 16 : rm <= 2.5 ? 12 : rm <= 3.0 ? 8 : rm <= 3.5 ? 4 : 0;
@@ -111,13 +139,29 @@
       parts.push({ label: 'Analyst view', points: ap, max: 20, detail: key + (nOp ? ' (' + nOp + ')' : '') });
     }
 
-    // 5. Upside to mean price target (0-20) — uses LIVE price
+    // 5. Upside to mean price target (0-10, uses LIVE price). Half-weight:
+    //    PTs lag price, so upside mechanically inflates after a crash.
     var pt = f.analyst && typeof f.analyst.targetMeanPrice === 'number' ? f.analyst.targetMeanPrice : null;
     var price = typeof t.price === 'number' ? t.price : null;
     if (pt != null && price != null && price > 0) {
       var upside = ((pt - price) / price) * 100;
-      var up = upside >= 25 ? 20 : upside >= 10 ? 15 : upside >= 0 ? 8 : upside >= -10 ? 4 : 0;
-      parts.push({ label: 'Upside to PT', points: up, max: 20, detail: (upside >= 0 ? '+' : '') + upside.toFixed(1) + '% to $' + pt.toFixed(0) });
+      var up = upside >= 25 ? 10 : upside >= 10 ? 7 : upside >= 0 ? 4 : upside >= -10 ? 2 : 0;
+      parts.push({ label: 'Upside to PT', points: up, max: 10, detail: (upside >= 0 ? '+' : '') + upside.toFixed(1) + '% to $' + pt.toFixed(0) });
+    }
+
+    // 6. 20-day momentum (0-20) — from priceHistory (daily closes) when the
+    //    dashboard carries it (SW schema does; AI schema doesn't). Uses the
+    //    live price as the endpoint so it tracks intraday. This is the
+    //    counterweight to #5: a crashing stock loses momentum points as its
+    //    "upside" expands.
+    var ph = t.priceHistory;
+    if (Array.isArray(ph) && ph.length >= 21 && price != null && price > 0) {
+      var then = ph[ph.length - 21];
+      if (typeof then === 'number' && then > 0) {
+        var mom = ((price - then) / then) * 100;
+        var mp = mom >= 15 ? 20 : mom >= 5 ? 15 : mom >= 0 ? 10 : mom >= -10 ? 5 : 0;
+        parts.push({ label: '20d momentum', points: mp, max: 20, detail: (mom >= 0 ? '+' : '') + mom.toFixed(1) + '% over 20 sessions' });
+      }
     }
 
     if (!parts.length) return null;
@@ -125,7 +169,12 @@
     var earned = parts.reduce(function (s, p) { return s + p.points; }, 0);
     var possible = parts.reduce(function (s, p) { return s + p.max; }, 0);
     var score = Math.round((earned / possible) * 100);
-    var label = score >= 70 ? 'Strong' : score >= 45 ? 'Moderate' : 'Weak';
+    var label;
+    if (parts.length < MIN_COVERAGE) {
+      label = 'Low data';
+    } else {
+      label = score >= 70 ? 'Strong' : score >= 45 ? 'Moderate' : 'Weak';
+    }
 
     return { score: score, label: label, breakdown: parts, dataCoverage: parts.length };
   }

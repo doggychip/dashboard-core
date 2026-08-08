@@ -137,7 +137,9 @@ function quoteSummaryToFundamentals(data) {
   const out = {};
 
   // ── EPS beat/miss history (last 4 quarters) ──
-  // earningsHistory.history is ordered oldest→newest; period is "-4q".."-1q".
+  // earningsHistory.history is nominally ordered oldest→newest ("-4q".."-1q"),
+  // but we sort by quarter date explicitly rather than trust the array order —
+  // "last quarter" logic downstream depends on it.
   const hist = r.earningsHistory?.history;
   if (Array.isArray(hist) && hist.length) {
     out.epsHistory = hist.map((h) => ({
@@ -149,7 +151,11 @@ function quoteSummaryToFundamentals(data) {
       beat: (num(h.epsActual) != null && num(h.epsEstimate) != null)
         ? num(h.epsActual) >= num(h.epsEstimate)
         : null,
-    })).filter((e) => e.epsActual != null);
+    })).filter((e) => e.epsActual != null)
+      .sort((a, b) => {
+        if (a.quarter && b.quarter) return a.quarter < b.quarter ? -1 : a.quarter > b.quarter ? 1 : 0;
+        return 0; // no dates → keep incoming order
+      });
   }
 
   // ── Quarterly revenue + earnings trend ──
